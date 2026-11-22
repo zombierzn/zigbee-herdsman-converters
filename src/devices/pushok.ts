@@ -1,6 +1,16 @@
+import {Zcl} from "zigbee-herdsman";
 import {access, presets} from "../lib/exposes";
 import * as m from "../lib/modernExtend";
 import type {DefinitionWithExtend, Fz, KeyValue, ModernExtend, Tz} from "../lib/types";
+import * as utils from "../lib/utils";
+
+interface PushokGenOnOff {
+    attributes: never;
+    commands: never;
+    commandResponses: {
+        pushokAction: {action: number};
+    };
+}
 
 const pushokExtend = {
     valveStatus: (args?: Partial<m.EnumLookupArgs<"genMultistateInput">>) =>
@@ -254,6 +264,109 @@ const pushokExtend = {
             isModernExtend: true,
         };
     },
+    onTime: (): ModernExtend => {
+        const exposes = [
+            presets
+                .numeric("on_time", access.SET)
+                .withUnit("s")
+                .withValueMin(1)
+                .withValueMax(6553)
+                .withValueStep(1)
+                .withDescription("Open, then close after this time"),
+        ];
+        const toZigbee: Tz.Converter[] = [
+            {
+                key: ["on_time"],
+                convertSet: async (entity, key, value, meta) => {
+                    // 0xFFFF is no timed off at all: the most is 6553 s
+                    const onTime = Math.min(Math.max(Math.round(Number(value)), 1), 6553);
+                    await entity.command(
+                        "genOnOff",
+                        "onWithTimedOff",
+                        {ctrlbits: 0, ontime: onTime * 10, offwaittime: 0},
+                        utils.getOptions(meta.mapped, entity),
+                    );
+                    return {state: {on_time: onTime}};
+                },
+            },
+        ];
+        return {exposes, toZigbee, isModernExtend: true};
+    },
+    pok019Action: (): ModernExtend => {
+        const lookup: Record<number, string> = {1: "double", 2: "both_buttons"};
+        const exposes = [presets.action(Object.values(lookup))];
+        const fromZigbee = [
+            {
+                cluster: "genOnOff",
+                type: ["commandPushokAction"],
+                convert: (model, msg, publish, options, meta) => {
+                    if (utils.hasAlreadyProcessedMessage(msg, model)) return;
+                    const action = lookup[msg.data.action];
+                    if (action !== undefined) return {action};
+                },
+            } satisfies Fz.Converter<"genOnOff", PushokGenOnOff, ["commandPushokAction"]>,
+        ];
+        // 0xFD, server to client, manufacturer code 0x5678: 1 a double click of the second button, 2 both buttons
+        const addCluster = m.deviceAddCustomCluster("genOnOff", {
+            name: "genOnOff",
+            ID: Zcl.Clusters.genOnOff.ID,
+            attributes: {},
+            commands: {},
+            commandsResponse: {
+                pushokAction: {name: "pushokAction", ID: 0xfd, parameters: [{name: "action", type: Zcl.DataType.UINT8, max: 0xff}]},
+            },
+        });
+        return {...addCluster, exposes, fromZigbee, isModernExtend: true};
+    },
+    pok009VoltageType: (): ModernExtend => {
+        const lookup = {AC: 0, DC: 1, DC_COUNTER: 2, AUTO: 3};
+        const extend = m.enumLookup({
+            name: "voltage_type",
+            lookup,
+            cluster: "genMultistateOutput",
+            attribute: "presentValue",
+            zigbeeCommandOptions: {},
+            description: "Mode",
+            access: "ALL",
+            reporting: null,
+        });
+        // The counter and auto from firmware 19, not on board revision 1
+        extend.exposes = [
+            (device, options) => {
+                const all = utils.isDummyDevice(device) || ((device.applicationVersion ?? 0) >= 19 && device.hardwareVersion !== 1);
+                return [presets.enum("voltage_type", access.ALL, all ? Object.keys(lookup) : ["AC", "DC"]).withDescription("Mode")];
+            },
+        ];
+        return extend;
+    },
+    pok009TgtVoltage: (): ModernExtend => {
+        const description = "Voltage threshold; in counter mode about 1 V below the pulses' top level";
+        const extend = m.numeric({
+            name: "tgt_voltage",
+            cluster: "genMultistateValue",
+            attribute: "presentValue",
+            description,
+            unit: "V",
+            access: "ALL",
+            valueMin: 3,
+            valueMax: 340,
+            valueStep: 1,
+            reporting: null,
+        });
+        // 3 V from firmware 20, 4 V before
+        extend.exposes = [
+            (device, options) => [
+                presets
+                    .numeric("tgt_voltage", access.ALL)
+                    .withUnit("V")
+                    .withValueMin(utils.isDummyDevice(device) || (device.applicationVersion ?? 0) >= 20 ? 3 : 4)
+                    .withValueMax(340)
+                    .withValueStep(1)
+                    .withDescription(description),
+            ],
+        ];
+        return extend;
+    },
     mp3Play: (): ModernExtend => {
         const volumeLevels = ["3", "6", "9", "12", "15", "18", "21", "24", "27", "30"];
         const defaultVolumeIndex = 7;
@@ -414,17 +527,7 @@ export const definitions: DefinitionWithExtend[] = [
             }),
             m.temperature({reporting: null}),
             m.battery({percentage: true, voltage: true, lowStatus: false, percentageReporting: false}),
-            pushokExtend.pulseCounter(),
-            m.enumLookup({
-                name: "operating_mode",
-                lookup: {contact: 1, counter: 2},
-                cluster: "genMultistateInput",
-                attribute: "presentValue",
-                zigbeeCommandOptions: {},
-                description: "Operating mode: contact sensor or pulse counter",
-                access: "ALL",
-                reporting: null,
-            }),
+            m.identify({isSleepy: true}),
         ],
         ota: true,
     },
@@ -534,26 +637,25 @@ export const definitions: DefinitionWithExtend[] = [
                 access: "STATE_GET",
                 reporting: null,
             }),
+            pushokExtend.pok009TgtVoltage(),
+            pushokExtend.pok009VoltageType(),
             m.numeric({
-                name: "tgt_voltage",
-                cluster: "genMultistateValue",
-                attribute: "presentValue",
-                description: "Voltage threshold",
-                unit: "V",
-                access: "ALL",
-                valueMin: 4,
-                valueMax: 340,
-                valueStep: 1,
+                name: "ac_frequency",
+                cluster: "haElectricalMeasurement",
+                attribute: "acFrequency",
+                description: "AC frequency, 0 on DC",
+                unit: "Hz",
+                access: "STATE_GET",
                 reporting: null,
             }),
-            m.enumLookup({
-                name: "voltage_type",
-                lookup: {AC: 0, DC: 1, DC_COUNTER: 2},
-                cluster: "genMultistateOutput",
-                attribute: "presentValue",
-                zigbeeCommandOptions: {},
-                description: "Mode",
-                access: "ALL",
+            m.numeric({
+                name: "crest_factor",
+                cluster: "haElectricalMeasurement",
+                attribute: {ID: 0x0b00, type: Zcl.DataType.UINT16},
+                description: "Crest factor of the AC voltage, 0 on DC",
+                scale: 1000,
+                precision: 2,
+                access: "STATE_GET",
                 reporting: null,
             }),
             m.identify({isSleepy: true}),
@@ -581,6 +683,7 @@ export const definitions: DefinitionWithExtend[] = [
             m.temperature({reporting: null}),
             m.humidity({reporting: null, access: "STATE"}),
             m.battery({percentage: true, voltage: true, lowStatus: false, percentageReporting: false}),
+            m.identify({isSleepy: true}),
             pushokExtend.pulseCounter(),
             m.enumLookup({
                 name: "operating_mode",
@@ -673,6 +776,8 @@ export const definitions: DefinitionWithExtend[] = [
                 access: "STATE_GET",
                 reporting: null,
             }),
+            pushokExtend.onTime(),
+            m.identify({isSleepy: true}),
         ],
         ota: true,
     },
@@ -691,7 +796,7 @@ export const definitions: DefinitionWithExtend[] = [
                 cluster: "genMultistateOutput",
                 attribute: "presentValue",
                 zigbeeCommandOptions: {},
-                description: "Heat sensitivity level for automatic vent opening",
+                description: "Heat sensitivity level for automatic vent opening (15-39 °C in 3 °C steps)",
                 access: "ALL",
                 reporting: null,
             }),
@@ -705,6 +810,8 @@ export const definitions: DefinitionWithExtend[] = [
                 access: "STATE_GET",
                 reporting: null,
             }),
+            pushokExtend.onTime(),
+            m.identify({isSleepy: true}),
         ],
         ota: true,
     },
@@ -740,7 +847,7 @@ export const definitions: DefinitionWithExtend[] = [
                 name: "rod_position",
                 cluster: "genAnalogOutput",
                 attribute: "presentValue",
-                description: "Rod position",
+                description: "Rod position, settable in system mode off",
                 unit: "%",
                 access: "ALL",
                 valueMin: 0,
@@ -773,6 +880,29 @@ export const definitions: DefinitionWithExtend[] = [
                 reporting: null,
             }),
             pushokExtend.pok020Thermostat(),
+            m.enumLookup({
+                name: "offline_action",
+                lookup: {NONE: 1, CLOSE_RESTORE: 2, OPEN_RESTORE: 3, CLOSE: 4, OPEN: 5, INTERNAL_SENSOR: 6, OPEN_25: 7},
+                cluster: "hvacThermostat",
+                attribute: {ID: 0x4000, type: Zcl.DataType.ENUM8},
+                zigbeeCommandOptions: {},
+                description:
+                    "What the valve does when the coordinator stops answering. " +
+                    "The RESTORE variants return to the previous state once it answers again",
+                access: "ALL",
+                reporting: null,
+            }),
+            m.enumLookup({
+                name: "offline_cause",
+                lookup: {NONE: 0, CLOSE_RESTORE: 2, OPEN_RESTORE: 3, CLOSE: 4, OPEN: 5, INTERNAL_SENSOR: 6, OPEN_25: 7},
+                cluster: "hvacThermostat",
+                attribute: {ID: 0x4001, type: Zcl.DataType.ENUM8},
+                zigbeeCommandOptions: {},
+                description: "Offline action the valve took, until the coordinator has seen it",
+                access: "STATE_GET",
+                reporting: null,
+            }),
+            m.identify({isSleepy: true}),
         ],
         ota: true,
     },
@@ -781,7 +911,11 @@ export const definitions: DefinitionWithExtend[] = [
         model: "POK021",
         vendor: "PushOk Hardware",
         description: "Gas pulse meter",
-        extend: [m.battery({percentage: true, voltage: true, lowStatus: false, percentageReporting: false}), pushokExtend.pulseCounter()],
+        extend: [
+            m.battery({percentage: true, voltage: true, lowStatus: false, percentageReporting: false}),
+            m.identify({isSleepy: true}),
+            pushokExtend.pulseCounter(),
+        ],
         ota: true,
     },
     {
@@ -825,6 +959,67 @@ export const definitions: DefinitionWithExtend[] = [
                 access: "STATE_GET",
                 reporting: null,
             }),
+            m.enumLookup({
+                name: "handle_preset",
+                lookup: {closed: 0, open: 1, micro_ventilation: 2, tilted: 3},
+                cluster: "closuresWindowCovering",
+                attribute: {ID: 0x0100, type: Zcl.DataType.UINT8},
+                zigbeeCommandOptions: {},
+                description: "Turn the handle to a preset position",
+                access: "ALL",
+                reporting: null,
+            }),
+            m.numeric({
+                name: "offset_closed",
+                cluster: "genMultistateOutput",
+                attribute: {ID: 0xfe00, type: Zcl.DataType.INT8},
+                description: "Closed (0°) position offset",
+                unit: "°",
+                access: "ALL",
+                valueMin: 0,
+                valueMax: 30,
+                valueStep: 3,
+                reporting: null,
+            }),
+            m.numeric({
+                name: "offset_open",
+                cluster: "genMultistateOutput",
+                attribute: {ID: 0xfe01, type: Zcl.DataType.INT8},
+                description: "Open (90°) position offset",
+                unit: "°",
+                access: "ALL",
+                valueMin: -15,
+                valueMax: 15,
+                valueStep: 3,
+                reporting: null,
+            }),
+            m.numeric({
+                name: "offset_micro_ventilation",
+                cluster: "genMultistateOutput",
+                attribute: {ID: 0xfe02, type: Zcl.DataType.INT8},
+                description: "Micro-ventilation (135°) position offset",
+                unit: "°",
+                access: "ALL",
+                valueMin: -15,
+                valueMax: 15,
+                valueStep: 3,
+                reporting: null,
+            }),
+            m.numeric({
+                name: "offset_tilted",
+                cluster: "genMultistateOutput",
+                attribute: {ID: 0xfe03, type: Zcl.DataType.INT8},
+                description: "Tilted (180°) position offset",
+                unit: "°",
+                access: "ALL",
+                valueMin: -30,
+                valueMax: 0,
+                valueStep: 3,
+                reporting: null,
+            }),
+            pushokExtend.pok019Action(),
+            pushokExtend.onTime(),
+            m.identify({isSleepy: true}),
         ],
         ota: true,
     },

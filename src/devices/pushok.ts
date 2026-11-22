@@ -1,8 +1,33 @@
 import {Zcl} from "zigbee-herdsman";
 import {access, presets} from "../lib/exposes";
 import * as m from "../lib/modernExtend";
-import type {DefinitionWithExtend, Fz, KeyValue, ModernExtend, Tz} from "../lib/types";
+import type {DefinitionWithExtend, Fz, KeyValue, ModernExtend, Tz, Zh} from "../lib/types";
 import * as utils from "../lib/utils";
+
+// The firmware from a version on: applicationVersion is read at the interview only, so the build
+// date that dateCode starts with (YYYYMMDD, re-read after an OTA) is checked too, as lumi.ts does
+const builtFrom = (device: Zh.Device, version: number, date: string) => {
+    const built = /^\d{8}/.exec(device.dateCode ?? "")?.[0];
+    return (device.applicationVersion ?? 0) >= version || (built !== undefined && built >= date);
+};
+
+// An extend exposed only on the devices `has` holds for (a dummy device, for the docs, has all)
+const exposedWhere = (extend: ModernExtend, has: (device: Zh.Device) => boolean): ModernExtend => {
+    const exposes = extend.exposes ?? [];
+    return {
+        ...extend,
+        exposes: [
+            (device, options) =>
+                utils.isDummyDevice(device) || has(device) ? exposes.flatMap((e) => (typeof e === "function" ? e(device, options) : [e])) : [],
+        ],
+    };
+};
+
+// POK009's counter, auto, frequency and crest factor: from firmware 19 (built from 2026-11-17),
+// not on the CC2530's board revision 1 nor on a board not known; the CC2340 build (SWBuildID "23")
+// has them on any board, its HWVersion is 1 when the board byte is unset
+const pok009Full = (device: Zh.Device) =>
+    builtFrom(device, 19, "20261117") && (device.softwareBuildID === "23" || (device.hardwareVersion ?? 1) >= 2);
 
 interface PushokGenOnOff {
     attributes: never;
@@ -278,8 +303,8 @@ const pushokExtend = {
             {
                 key: ["on_time"],
                 convertSet: async (entity, key, value, meta) => {
-                    // 0xFFFF is no timed off at all: the most is 6553 s
-                    const onTime = Math.min(Math.max(Math.round(Number(value)), 1), 6553);
+                    // 0xFFFF is no timed off at all: the most is 6553 s, and no value is not a number
+                    const onTime = Math.min(Math.max(Math.round(utils.toNumber(value, key)), 1), 6553);
                     await entity.command(
                         "genOnOff",
                         "onWithTimedOff",
@@ -330,10 +355,10 @@ const pushokExtend = {
             access: "ALL",
             reporting: null,
         });
-        // The counter and auto from firmware 19, not on board revision 1
+        // The counter and auto where pok009Full
         extend.exposes = [
             (device, options) => {
-                const all = utils.isDummyDevice(device) || ((device.applicationVersion ?? 0) >= 19 && device.hardwareVersion !== 1);
+                const all = utils.isDummyDevice(device) || pok009Full(device);
                 return [presets.enum("voltage_type", access.ALL, all ? Object.keys(lookup) : ["AC", "DC"]).withDescription("Mode")];
             },
         ];
@@ -353,13 +378,13 @@ const pushokExtend = {
             valueStep: 1,
             reporting: null,
         });
-        // 3 V from firmware 20, 4 V before
+        // 3 V from firmware 20 (built from 2026-11-20), 4 V before
         extend.exposes = [
             (device, options) => [
                 presets
                     .numeric("tgt_voltage", access.ALL)
                     .withUnit("V")
-                    .withValueMin(utils.isDummyDevice(device) || (device.applicationVersion ?? 0) >= 20 ? 3 : 4)
+                    .withValueMin(utils.isDummyDevice(device) || builtFrom(device, 20, "20261120") ? 3 : 4)
                     .withValueMax(340)
                     .withValueStep(1)
                     .withDescription(description),
@@ -527,6 +552,17 @@ export const definitions: DefinitionWithExtend[] = [
             }),
             m.temperature({reporting: null}),
             m.battery({percentage: true, voltage: true, lowStatus: false, percentageReporting: false}),
+            pushokExtend.pulseCounter(),
+            m.enumLookup({
+                name: "operating_mode",
+                lookup: {contact: 1, counter: 2},
+                cluster: "genMultistateInput",
+                attribute: "presentValue",
+                zigbeeCommandOptions: {},
+                description: "Operating mode: contact sensor or pulse counter",
+                access: "ALL",
+                reporting: null,
+            }),
             m.identify({isSleepy: true}),
         ],
         ota: true,
@@ -639,25 +675,31 @@ export const definitions: DefinitionWithExtend[] = [
             }),
             pushokExtend.pok009TgtVoltage(),
             pushokExtend.pok009VoltageType(),
-            m.numeric({
-                name: "ac_frequency",
-                cluster: "haElectricalMeasurement",
-                attribute: "acFrequency",
-                description: "AC frequency, 0 on DC",
-                unit: "Hz",
-                access: "STATE_GET",
-                reporting: null,
-            }),
-            m.numeric({
-                name: "crest_factor",
-                cluster: "haElectricalMeasurement",
-                attribute: {ID: 0x0b00, type: Zcl.DataType.UINT16},
-                description: "Crest factor of the AC voltage, 0 on DC",
-                scale: 1000,
-                precision: 2,
-                access: "STATE_GET",
-                reporting: null,
-            }),
+            exposedWhere(
+                m.numeric({
+                    name: "ac_frequency",
+                    cluster: "haElectricalMeasurement",
+                    attribute: "acFrequency",
+                    description: "AC frequency, 0 on DC",
+                    unit: "Hz",
+                    access: "STATE_GET",
+                    reporting: null,
+                }),
+                pok009Full,
+            ),
+            exposedWhere(
+                m.numeric({
+                    name: "crest_factor",
+                    cluster: "haElectricalMeasurement",
+                    attribute: {ID: 0x0b00, type: Zcl.DataType.UINT16},
+                    description: "Crest factor of the AC voltage, 0 on DC",
+                    scale: 1000,
+                    precision: 2,
+                    access: "STATE_GET",
+                    reporting: null,
+                }),
+                pok009Full,
+            ),
             m.identify({isSleepy: true}),
             m.battery({percentage: true, voltage: true, lowStatus: true, percentageReporting: false}),
             pushokExtend.pulseCounter(),
@@ -880,28 +922,35 @@ export const definitions: DefinitionWithExtend[] = [
                 reporting: null,
             }),
             pushokExtend.pok020Thermostat(),
-            m.enumLookup({
-                name: "offline_action",
-                lookup: {NONE: 1, CLOSE_RESTORE: 2, OPEN_RESTORE: 3, CLOSE: 4, OPEN: 5, INTERNAL_SENSOR: 6, OPEN_25: 7},
-                cluster: "hvacThermostat",
-                attribute: {ID: 0x4000, type: Zcl.DataType.ENUM8},
-                zigbeeCommandOptions: {},
-                description:
-                    "What the valve does when the coordinator stops answering. " +
-                    "The RESTORE variants return to the previous state once it answers again",
-                access: "ALL",
-                reporting: null,
-            }),
-            m.enumLookup({
-                name: "offline_cause",
-                lookup: {NONE: 0, CLOSE_RESTORE: 2, OPEN_RESTORE: 3, CLOSE: 4, OPEN: 5, INTERNAL_SENSOR: 6, OPEN_25: 7},
-                cluster: "hvacThermostat",
-                attribute: {ID: 0x4001, type: Zcl.DataType.ENUM8},
-                zigbeeCommandOptions: {},
-                description: "Offline action the valve took, until the coordinator has seen it",
-                access: "STATE_GET",
-                reporting: null,
-            }),
+            // From firmware 35 (built from 2026-10-29)
+            exposedWhere(
+                m.enumLookup({
+                    name: "offline_action",
+                    lookup: {NONE: 1, CLOSE_RESTORE: 2, OPEN_RESTORE: 3, CLOSE: 4, OPEN: 5, INTERNAL_SENSOR: 6, OPEN_25: 7},
+                    cluster: "hvacThermostat",
+                    attribute: {ID: 0x4000, type: Zcl.DataType.ENUM8},
+                    zigbeeCommandOptions: {},
+                    description:
+                        "What the valve does when the coordinator stops answering. " +
+                        "The RESTORE variants return to the previous state once it answers again",
+                    access: "ALL",
+                    reporting: null,
+                }),
+                (device) => builtFrom(device, 35, "20261029"),
+            ),
+            exposedWhere(
+                m.enumLookup({
+                    name: "offline_cause",
+                    lookup: {NONE: 0, CLOSE_RESTORE: 2, OPEN_RESTORE: 3, CLOSE: 4, OPEN: 5, INTERNAL_SENSOR: 6, OPEN_25: 7},
+                    cluster: "hvacThermostat",
+                    attribute: {ID: 0x4001, type: Zcl.DataType.ENUM8},
+                    zigbeeCommandOptions: {},
+                    description: "Offline action the valve took, until the coordinator has seen it",
+                    access: "STATE_GET",
+                    reporting: null,
+                }),
+                (device) => builtFrom(device, 35, "20261029"),
+            ),
             m.identify({isSleepy: true}),
         ],
         ota: true,
